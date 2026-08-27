@@ -6,8 +6,6 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
     ca-certificates \
     fonts-nanum \
     fonts-noto-cjk \
@@ -29,6 +27,7 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     libatspi2.0-0 \
     libgtk-3-0 \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
