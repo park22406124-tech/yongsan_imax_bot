@@ -30,14 +30,23 @@ def check_cgv_status():
     response = requests.get(URL, headers=headers, timeout=5)
     soup = BeautifulSoup(response.text, "html.parser")
 
-    imax_tags = soup.select("span.imax")
+    # 용산 상영표 내 모든 영화 블록(col-times) 검사
+    movie_blocks = soup.select("div.col-times")
 
-    for imax in imax_tags:
-      movie_div = imax.find_parent("div", class_="col-times")
-      if movie_div:
-        movie_title = movie_div.select_one("a").text.strip()
-        if "오디세이" in movie_title:
-          return True, movie_title
+    for block in movie_blocks:
+      text_content = block.get_text()
+
+      # 해당 영화 블록 내에 '오디세이'와 'IMAX' 글자가 모두 포함되어 있는지 확인
+      if "오디세이" in text_content and "IMAX" in text_content:
+        # 영화 제목 텍스트 추출
+        title_tag = block.select_one("div.info-movie a") or block.select_one(
+            "a"
+        )
+        movie_title = (
+            title_tag.text.strip() if title_tag else "오디세이 (IMAX)"
+        )
+        return True, movie_title
+
     return False, None
   except Exception as e:
     print(f"CGV 크롤링 에러: {e}")
