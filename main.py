@@ -5,22 +5,27 @@ import time
 from datetime import datetime, timedelta
 
 import requests
-
-try:
-    from curl_cffi import requests as curl_requests
-except ImportError:
-    curl_requests = None
+from curl_cffi import requests as curl_requests
 
 
 # ============================================================
-# 기본 설정
+# 설정
 # ============================================================
 
-API_URL = "https://api.cgv.co.kr/cnm/atkt/searchMovScnInfo"
+CGV_WEB_URL = os.getenv(
+    "CGV_WEB_URL",
+    "https://cgv.co.kr/cnm/movieBook/cinema",
+).strip()
 
-THEATER_NAME = os.getenv(
-    "THEATER_NAME",
-    "용산아이파크몰",
+CGV_API_URL = os.getenv(
+    "CGV_API_URL",
+    "https://api.cgv.co.kr/cnm/atkt/searchMovScnInfo",
+).strip()
+
+# CGV 기본 파라미터
+CO_CD = os.getenv(
+    "CO_CD",
+    "A420",
 ).strip()
 
 SITE_NO = os.getenv(
@@ -28,15 +33,23 @@ SITE_NO = os.getenv(
     "0013",
 ).strip()
 
-CO_CD = os.getenv(
-    "CO_CD",
-    "A420",
-).strip()
-
 RTCTL_SCOP_CD = os.getenv(
     "RTCTL_SCOP_CD",
     "08",
 ).strip()
+
+# ------------------------------------------------------------
+# 극장
+# ------------------------------------------------------------
+
+THEATER_NAME = os.getenv(
+    "THEATER_NAME",
+    "용산아이파크몰",
+).strip()
+
+# ------------------------------------------------------------
+# 영화
+# ------------------------------------------------------------
 
 MOVIE_ALIASES = [
     x.strip()
@@ -47,6 +60,10 @@ MOVIE_ALIASES = [
     if x.strip()
 ]
 
+# ------------------------------------------------------------
+# 상영 포맷
+# ------------------------------------------------------------
+
 FORMAT_KEYWORDS = [
     x.strip().lower()
     for x in os.getenv(
@@ -56,8 +73,12 @@ FORMAT_KEYWORDS = [
     if x.strip()
 ]
 
+# ------------------------------------------------------------
+# 검사 주기
+# ------------------------------------------------------------
+
 INTERVAL_SECONDS = max(
-    20,
+    10,
     int(
         os.getenv(
             "INTERVAL_SECONDS",
@@ -66,6 +87,7 @@ INTERVAL_SECONDS = max(
     ),
 )
 
+# 오늘 + 며칠
 DAYS_AHEAD = max(
     0,
     int(
@@ -76,15 +98,31 @@ DAYS_AHEAD = max(
     ),
 )
 
+# API timeout
 REQUEST_TIMEOUT = max(
     5,
     int(
         os.getenv(
             "REQUEST_TIMEOUT",
-            "30",
+            "20",
         )
     ),
 )
+
+# API 재시도
+API_RETRIES = max(
+    1,
+    int(
+        os.getenv(
+            "API_RETRIES",
+            "2",
+        )
+    ),
+)
+
+# ------------------------------------------------------------
+# Telegram
+# ------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
@@ -95,6 +133,10 @@ TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID",
     "",
 ).strip()
+
+# ------------------------------------------------------------
+# Railway Health Server
+# ------------------------------------------------------------
 
 PORT = int(
     os.getenv(
@@ -123,12 +165,12 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# 전역 상태
+# 전역
 # ============================================================
 
-monitor_enabled = True
+http_session = None
 
-monitor_lock = asyncio.Lock()
+monitor_enabled = True
 
 seen_sessions = {}
 
@@ -136,9 +178,11 @@ last_api_response = 0
 
 last_api_status = None
 
-last_api_error = None
+last_successful_scan = 0
 
-http_session = None
+telegram_update_offset = 0
+
+scan_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -153,14 +197,32 @@ def make_ymd(offset=0):
 
 
 def pretty_date(ymd):
-    if not ymd or len(ymd) != 8:
-        return str(ymd)
+    if not ymd:
+        return ""
+
+    text = str(ymd)
+
+    if len(text) != 8:
+        return text
 
     return (
-        f"{ymd[:4]}-"
-        f"{ymd[4:6]}-"
-        f"{ymd[6:]}"
+        f"{text[:4]}-"
+        f"{text[4:6]}-"
+        f"{text[6:]}"
     )
+
+
+# ============================================================
+# Chrome User-Agent
+# ============================================================
+
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 "
+    "(KHTML, like Gecko) "
+    "Chrome/138.0.0.0 "
+    "Safari/537.36"
+)
 
 
 # ============================================================
@@ -169,48 +231,84 @@ def pretty_date(ymd):
 
 def create_http_session():
 
+    logger.info(
+        "🌐 curl_cffi Chrome 세션 생성"
+    )
+
+    session = curl_requests.Session(
+        impersonate="chrome",
+    )
+
+    session.headers.update(
+        {
+            "User-Agent": CHROME_USER_AGENT,
+            "Accept": (
+                "application/json, text/plain, */*"
+            ),
+            "Accept-Language": (
+                "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+            ),
+            "Connection": "keep-alive",
+        }
+    )
+
+    return session
+
+
+# ============================================================
+# CGV 웹 세션 준비
+# ============================================================
+
+def warm_up_cgv():
+
     global http_session
 
-    if curl_requests is not None:
+    if http_session is None:
+        http_session = create_http_session()
+
+    logger.info(
+        "🌐 CGV 웹 페이지 세션 준비"
+    )
+
+    try:
+
+        response = http_session.get(
+            CGV_WEB_URL,
+            headers={
+                "User-Agent": CHROME_USER_AGENT,
+                "Accept": (
+                    "text/html,application/xhtml+xml,"
+                    "application/xml;q=0.9,image/avif,"
+                    "image/webp,*/*;q=0.8"
+                ),
+                "Accept-Language": (
+                    "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+                ),
+                "Upgrade-Insecure-Requests": "1",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
 
         logger.info(
-            "curl_cffi 사용: impersonate=chrome"
+            "🌐 CGV 웹 HTTP %s",
+            response.status_code,
         )
 
-        http_session = curl_requests.Session(
-            impersonate="chrome",
+        logger.info(
+            "🍪 CGV cookies=%d",
+            len(http_session.cookies),
         )
 
-    else:
+        return response.status_code
+
+    except Exception as exc:
 
         logger.warning(
-            "curl_cffi 없음. 일반 requests 사용"
+            "CGV 웹 세션 준비 실패: %s",
+            exc,
         )
 
-        http_session = requests.Session()
-
-    return http_session
-
-
-# ============================================================
-# 기본 헤더
-# ============================================================
-
-def build_headers():
-
-    return {
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Connection": "keep-alive",
-        "Referer": "https://cgv.co.kr/",
-        "Origin": "https://cgv.co.kr",
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/138.0.0.0 Safari/537.36"
-        ),
-    }
+        return None
 
 
 # ============================================================
@@ -247,7 +345,6 @@ def send_telegram(
     }
 
     if buttons:
-
         payload["reply_markup"] = {
             "inline_keyboard": buttons
         }
@@ -283,7 +380,7 @@ def send_telegram(
 
 
 # ============================================================
-# Telegram API
+# Telegram async API
 # ============================================================
 
 async def telegram_api(
@@ -341,9 +438,8 @@ async def telegram_api(
 
 async def telegram_command_loop():
 
+    global telegram_update_offset
     global monitor_enabled
-
-    offset = 0
 
     if not TELEGRAM_BOT_TOKEN:
 
@@ -354,7 +450,7 @@ async def telegram_command_loop():
         return
 
     logger.info(
-        "Telegram 명령어 감시 시작"
+        "📱 Telegram 명령어 감시 시작"
     )
 
     await telegram_api(
@@ -371,7 +467,7 @@ async def telegram_command_loop():
             result = await telegram_api(
                 "getUpdates",
                 {
-                    "offset": offset,
+                    "offset": telegram_update_offset,
                     "timeout": 20,
                     "allowed_updates": [
                         "message"
@@ -382,20 +478,17 @@ async def telegram_command_loop():
             if not result or not result.get("ok"):
 
                 await asyncio.sleep(3)
-
                 continue
 
-            for update in result.get(
+            updates = result.get(
                 "result",
                 [],
-            ):
+            )
 
-                offset = (
-                    update.get(
-                        "update_id",
-                        0,
-                    )
-                    + 1
+            for update in updates:
+
+                telegram_update_offset = (
+                    update["update_id"] + 1
                 )
 
                 message = update.get(
@@ -405,11 +498,13 @@ async def telegram_command_loop():
                 if not message:
                     continue
 
+                chat = message.get(
+                    "chat",
+                    {},
+                )
+
                 chat_id = str(
-                    message.get(
-                        "chat",
-                        {},
-                    ).get(
+                    chat.get(
                         "id",
                         "",
                     )
@@ -417,8 +512,14 @@ async def telegram_command_loop():
 
                 if (
                     TELEGRAM_CHAT_ID
-                    and chat_id != TELEGRAM_CHAT_ID
+                    and chat_id
+                    != TELEGRAM_CHAT_ID
                 ):
+
+                    logger.warning(
+                        "허용되지 않은 Telegram 채팅방: %s",
+                        chat_id,
+                    )
 
                     continue
 
@@ -432,12 +533,16 @@ async def telegram_command_loop():
                 )
 
                 # ------------------------------------------------
-                # /start
+                # START
                 # ------------------------------------------------
 
                 if text == "/start":
 
                     monitor_enabled = True
+
+                    logger.info(
+                        "▶️ /start"
+                    )
 
                     send_telegram(
                         "🟢 <b>용아맥 API 감시를 시작했습니다.</b>\n\n"
@@ -445,25 +550,29 @@ async def telegram_command_loop():
                         f"🏢 {THEATER_NAME}\n"
                         "🎞️ IMAX\n"
                         f"⏱️ {INTERVAL_SECONDS}초 간격\n\n"
-                        "📡 CGV 시간표 API 직접 조회 방식"
+                        "📡 CGV API 직접 조회 방식"
                     )
 
                 # ------------------------------------------------
-                # /stop
+                # STOP
                 # ------------------------------------------------
 
                 elif text == "/stop":
 
                     monitor_enabled = False
 
+                    logger.info(
+                        "⏸️ /stop"
+                    )
+
                     send_telegram(
-                        "⏸️ <b>용아맥 API 감시를 중지했습니다.</b>\n\n"
-                        "봇은 계속 실행 중입니다.\n"
-                        "/start 로 다시 시작할 수 있습니다."
+                        "⏸️ <b>용아맥 감시를 중지했습니다.</b>\n\n"
+                        "프로그램과 Telegram 명령어는 계속 실행됩니다.\n"
+                        "다시 감시하려면 /start"
                     )
 
                 # ------------------------------------------------
-                # /status
+                # STATUS
                 # ------------------------------------------------
 
                 elif text in (
@@ -490,38 +599,56 @@ async def telegram_command_loop():
 
                     else:
 
-                        response_text = "아직 없음"
+                        response_text = (
+                            "아직 없음"
+                        )
+
+                    if last_successful_scan:
+
+                        elapsed = int(
+                            time.time()
+                            - last_successful_scan
+                        )
+
+                        scan_text = (
+                            f"{elapsed}초 전"
+                        )
+
+                    else:
+
+                        scan_text = "아직 없음"
 
                     send_telegram(
                         "📊 <b>용아맥 API 봇 상태</b>\n\n"
                         f"상태: {monitor_text}\n"
                         f"극장: {THEATER_NAME}\n"
-                        f"siteNo: {SITE_NO}\n"
-                        f"coCd: {CO_CD}\n"
-                        f"rtctlScopCd: {RTCTL_SCOP_CD}\n"
+                        "🎞️ IMAX\n"
                         f"검사 간격: {INTERVAL_SECONDS}초\n"
-                        f"최근 API 응답: {response_text}\n"
-                        f"최근 HTTP 상태: {last_api_status or '없음'}"
+                        f"마지막 API 응답: {response_text}\n"
+                        f"마지막 정상 검사: {scan_text}\n"
+                        f"마지막 HTTP: {last_api_status}"
                     )
 
                 # ------------------------------------------------
-                # /test
+                # TEST
                 # ------------------------------------------------
 
                 elif text == "/test":
 
+                    logger.info(
+                        "🔎 /test"
+                    )
+
                     send_telegram(
-                        "🔎 <b>CGV 시간표 API 테스트 중...</b>\n\n"
-                        f"📅 {pretty_date(make_ymd(0))}\n"
-                        f"🏢 {THEATER_NAME}\n"
-                        "🎞️ IMAX"
+                        "🔎 <b>CGV API를 직접 조회하는 중...</b>\n\n"
+                        "화면을 클릭하지 않고\n"
+                        "CGV 시간표 API를 조회합니다."
                     )
 
                     try:
 
-                        sessions = await scan_date(
-                            make_ymd(0),
-                            include_sold_out=True,
+                        sessions = (
+                            await perform_test_scan()
                         )
 
                         if sessions:
@@ -553,13 +680,10 @@ async def telegram_command_loop():
                                 )
 
                                 if total:
-
                                     seat_text = (
                                         f"{seats}/{total}석"
                                     )
-
                                 else:
-
                                     seat_text = (
                                         f"{seats}석"
                                     )
@@ -583,9 +707,9 @@ async def telegram_command_loop():
                         else:
 
                             send_telegram(
-                                "🔎 <b>오늘 용아맥 IMAX 현황</b>\n\n"
-                                "조회된 오디세이 IMAX 회차가 없습니다.\n\n"
-                                f"HTTP 상태: {last_api_status or '없음'}"
+                                "🔎 <b>오늘 용아맥 API 조회 결과</b>\n\n"
+                                "현재 조건에 맞는 IMAX 회차가 없습니다.\n\n"
+                                "영화 / IMAX 필터 또는 CGV API 응답을 확인하세요."
                             )
 
                     except Exception as exc:
@@ -596,7 +720,7 @@ async def telegram_command_loop():
 
                         send_telegram(
                             "🔴 <b>/test 실패</b>\n\n"
-                            f"{str(exc)[:700]}"
+                            f"{str(exc)[:800]}"
                         )
 
         except asyncio.CancelledError:
@@ -617,17 +741,17 @@ async def telegram_command_loop():
 # CGV API 호출
 # ============================================================
 
-async def call_cgv_api(
+def request_cgv_api(
     scn_ymd,
 ):
 
+    global http_session
     global last_api_response
     global last_api_status
-    global last_api_error
 
     if http_session is None:
 
-        create_http_session()
+        http_session = create_http_session()
 
     params = {
         "coCd": CO_CD,
@@ -636,11 +760,17 @@ async def call_cgv_api(
         "rtctlScopCd": RTCTL_SCOP_CD,
     }
 
-    headers = build_headers()
-
-    logger.info(
-        "=========================================="
-    )
+    headers = {
+        "User-Agent": CHROME_USER_AGENT,
+        "Accept": (
+            "application/json, text/plain, */*"
+        ),
+        "Accept-Language": (
+            "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
+        ),
+        "Referer": CGV_WEB_URL,
+        "Origin": "https://cgv.co.kr",
+    }
 
     logger.info(
         "📡 CGV API 요청"
@@ -648,7 +778,7 @@ async def call_cgv_api(
 
     logger.info(
         "URL: %s",
-        API_URL,
+        CGV_API_URL,
     )
 
     logger.info(
@@ -656,136 +786,147 @@ async def call_cgv_api(
         params,
     )
 
-    try:
+    for attempt in range(
+        1,
+        API_RETRIES + 1,
+    ):
 
-        def request():
+        try:
 
-            return http_session.get(
-                API_URL,
+            response = http_session.get(
+                CGV_API_URL,
                 params=params,
                 headers=headers,
                 timeout=REQUEST_TIMEOUT,
             )
 
-        response = await asyncio.to_thread(
-            request
-        )
+            last_api_response = time.time()
+            last_api_status = response.status_code
 
-        last_api_response = time.time()
-
-        last_api_status = response.status_code
-
-        logger.info(
-            "📡 CGV API HTTP %s",
-            response.status_code,
-        )
-
-        logger.info(
-            "최종 URL: %s",
-            response.url,
-        )
-
-        # --------------------------------------------------------
-        # 401
-        # --------------------------------------------------------
-
-        if response.status_code == 401:
-
-            body = response.text[:1500]
-
-            last_api_error = (
-                f"HTTP 401: {body}"
-            )
-
-            logger.error(
-                "🔴 CGV API 401 인증 거부"
-            )
-
-            logger.error(
-                "응답: %s",
-                body,
-            )
-
-            return None
-
-        # --------------------------------------------------------
-        # 기타 HTTP 오류
-        # --------------------------------------------------------
-
-        if response.status_code != 200:
-
-            body = response.text[:1500]
-
-            last_api_error = (
-                f"HTTP {response.status_code}: {body}"
-            )
-
-            logger.error(
-                "🔴 CGV API 오류: HTTP %s",
+            logger.info(
+                "📡 CGV API HTTP %s",
                 response.status_code,
             )
 
-            logger.error(
-                "응답: %s",
-                body,
+            logger.info(
+                "최종 URL: %s",
+                response.url,
             )
 
-            return None
+            text = response.text
 
-        # --------------------------------------------------------
-        # JSON
-        # --------------------------------------------------------
+            # ------------------------------------------------
+            # 401
+            # ------------------------------------------------
 
-        try:
+            if response.status_code == 401:
 
-            data = response.json()
+                logger.error(
+                    "🔴 CGV API 401 인증 거부"
+                )
+
+                logger.error(
+                    "응답: %s",
+                    text[:1000],
+                )
+
+                return None
+
+            # ------------------------------------------------
+            # 기타 HTTP 오류
+            # ------------------------------------------------
+
+            if response.status_code != 200:
+
+                logger.error(
+                    "🔴 CGV API HTTP 오류: %s",
+                    response.status_code,
+                )
+
+                logger.error(
+                    "응답: %s",
+                    text[:1000],
+                )
+
+                if attempt < API_RETRIES:
+
+                    time.sleep(1)
+                    continue
+
+                return None
+
+            # ------------------------------------------------
+            # JSON
+            # ------------------------------------------------
+
+            try:
+
+                data = response.json()
+
+            except Exception as exc:
+
+                logger.error(
+                    "🔴 JSON 파싱 실패: %s",
+                    exc,
+                )
+
+                logger.error(
+                    "응답: %s",
+                    text[:1000],
+                )
+
+                return None
+
+            if not isinstance(
+                data,
+                dict,
+            ):
+
+                logger.error(
+                    "🔴 예상하지 못한 API 응답"
+                )
+
+                return None
+
+            status_code = data.get(
+                "statusCode"
+            )
+
+            status_message = data.get(
+                "statusMessage"
+            )
+
+            logger.info(
+                "CGV API statusCode=%s statusMessage=%s",
+                status_code,
+                status_message,
+            )
+
+            return data
 
         except Exception as exc:
 
-            last_api_error = (
-                f"JSON parse error: {exc}"
-            )
-
             logger.error(
-                "🔴 JSON 파싱 실패"
+                "CGV API 요청 예외 (%d/%d): %s",
+                attempt,
+                API_RETRIES,
+                exc,
             )
 
-            logger.error(
-                "응답: %s",
-                response.text[:1500],
-            )
+            if attempt < API_RETRIES:
 
-            return None
+                time.sleep(1)
 
-        logger.info(
-            "✅ CGV JSON 응답 확보"
-        )
-
-        logger.info(
-            "JSON 최상위 keys: %s",
-            list(data.keys())
-            if isinstance(data, dict)
-            else type(data).__name__,
-        )
-
-        return data
-
-    except Exception as exc:
-
-        last_api_error = str(exc)
-
-        logger.exception(
-            "🔴 CGV API 요청 실패"
-        )
-
-        return None
+    return None
 
 
 # ============================================================
 # rows 추출
 # ============================================================
 
-def extract_rows(payload):
+def extract_rows(
+    payload,
+):
 
     if not isinstance(
         payload,
@@ -795,8 +936,7 @@ def extract_rows(payload):
         return []
 
     data = payload.get(
-        "data",
-        [],
+        "data"
     )
 
     if isinstance(
@@ -818,8 +958,9 @@ def extract_rows(payload):
             "schedule",
             "scnList",
             "movieList",
-            "scnInfo",
             "resultList",
+            "contents",
+            "items",
         ]:
 
             value = data.get(
@@ -833,26 +974,6 @@ def extract_rows(payload):
 
                 return value
 
-    # 혹시 data 아래에 또 다른 구조가 있는 경우
-    if isinstance(
-        data,
-        dict,
-    ):
-
-        for value in data.values():
-
-            if isinstance(
-                value,
-                list,
-            ):
-
-                if value and isinstance(
-                    value[0],
-                    dict,
-                ):
-
-                    return value
-
     return []
 
 
@@ -860,7 +981,9 @@ def extract_rows(payload):
 # 영화 필터
 # ============================================================
 
-def target_movie(row):
+def target_movie(
+    row,
+):
 
     values = [
         row.get("movNm"),
@@ -869,12 +992,14 @@ def target_movie(row):
         row.get("expoProdNm"),
         row.get("engProdNm"),
         row.get("movieNm"),
+        row.get("movieName"),
+        row.get("movName"),
     ]
 
     text = " ".join(
-        str(value)
-        for value in values
-        if value is not None
+        str(x)
+        for x in values
+        if x is not None
     ).lower()
 
     return any(
@@ -887,7 +1012,9 @@ def target_movie(row):
 # IMAX 필터
 # ============================================================
 
-def target_format(row):
+def target_format(
+    row,
+):
 
     values = [
         row.get("movkndDsplNm"),
@@ -898,12 +1025,15 @@ def target_format(row):
         row.get("screenNm"),
         row.get("screenName"),
         row.get("tcscnsGradNm"),
+        row.get("screenType"),
+        row.get("screenNmKor"),
+        row.get("scnTypeNm"),
     ]
 
     text = " ".join(
-        str(value)
-        for value in values
-        if value is not None
+        str(x)
+        for x in values
+        if x is not None
     ).lower()
 
     return any(
@@ -913,16 +1043,20 @@ def target_format(row):
 
 
 # ============================================================
-# 좌석
+# 좌석 수
 # ============================================================
 
-def seat_count(row):
+def seat_count(
+    row,
+):
 
     for key in [
         "frSeatCnt",
         "remainSeatCnt",
         "availableSeatCnt",
         "seatCnt",
+        "rmSeatCnt",
+        "remainCnt",
     ]:
 
         try:
@@ -933,21 +1067,33 @@ def seat_count(row):
 
             if value is not None:
 
-                return int(value)
+                return int(
+                    str(value).replace(
+                        ",",
+                        "",
+                    )
+                )
 
         except Exception:
-
             continue
 
     return 0
 
 
-def total_seat_count(row):
+# ============================================================
+# 전체 좌석
+# ============================================================
+
+def total_seat_count(
+    row,
+):
 
     for key in [
         "stcnt",
         "totalSeatCnt",
         "totalSeats",
+        "seatTotalCnt",
+        "totSeatCnt",
     ]:
 
         try:
@@ -958,13 +1104,56 @@ def total_seat_count(row):
 
             if value is not None:
 
-                return int(value)
+                return int(
+                    str(value).replace(
+                        ",",
+                        "",
+                    )
+                )
 
         except Exception:
-
             continue
 
     return None
+
+
+# ============================================================
+# 시간
+# ============================================================
+
+def format_time(
+    value,
+):
+
+    if value is None:
+        return "??:??"
+
+    text = str(
+        value
+    ).strip()
+
+    # 4자리 HHMM
+    if (
+        len(text) == 4
+        and text.isdigit()
+    ):
+
+        return (
+            text[:2]
+            + ":"
+            + text[2:]
+        )
+
+    # HH:MM:SS
+    if len(text) >= 5:
+
+        if (
+            text[2] == ":"
+        ):
+
+            return text[:5]
+
+    return text
 
 
 # ============================================================
@@ -997,13 +1186,29 @@ def parse_sessions(
 
             continue
 
-        if not target_movie(row):
+        # ----------------------------------------------------
+        # 영화
+        # ----------------------------------------------------
+
+        if not target_movie(
+            row
+        ):
 
             continue
 
-        if not target_format(row):
+        # ----------------------------------------------------
+        # IMAX
+        # ----------------------------------------------------
+
+        if not target_format(
+            row
+        ):
 
             continue
+
+        # ----------------------------------------------------
+        # 좌석
+        # ----------------------------------------------------
 
         seats = seat_count(
             row
@@ -1016,71 +1221,86 @@ def parse_sessions(
 
             continue
 
+        # ----------------------------------------------------
+        # 상영 통제
+        # ----------------------------------------------------
+
         if row.get(
             "cntlYn"
         ) == "Y":
 
             continue
 
+        item = {
+            "date": scn_ymd,
+
+            "movNo": (
+                row.get("movNo")
+                or row.get("movieNo")
+            ),
+
+            "movNm": (
+                row.get("movNm")
+                or row.get("prodNm")
+                or row.get("movieNm")
+                or "오디세이"
+            ),
+
+            "scnSseq": (
+                row.get("scnSseq")
+                or row.get("screenSeq")
+            ),
+
+            "scnsNo": (
+                row.get("scnsNo")
+                or row.get("screenNo")
+            ),
+
+            "start": (
+                row.get("scnsrtTm")
+                or row.get("scnStartTm")
+                or row.get("startTime")
+                or row.get("startTm")
+            ),
+
+            "end": (
+                row.get("scnendTm")
+                or row.get("scnEndTm")
+                or row.get("endTime")
+                or row.get("endTm")
+            ),
+
+            "screen": (
+                row.get("expoScnsNm")
+                or row.get("scnsNm")
+                or row.get("scnsEnm")
+                or row.get("screenNm")
+                or "IMAX"
+            ),
+
+            "seats": seats,
+
+            "totalSeats": total_seat_count(
+                row
+            ),
+        }
+
         result.append(
-            {
-                "date": scn_ymd,
-
-                "movNo": row.get(
-                    "movNo"
-                ),
-
-                "movNm": (
-                    row.get("movNm")
-                    or row.get("prodNm")
-                    or row.get("movieNm")
-                    or "오디세이"
-                ),
-
-                "scnSseq": row.get(
-                    "scnSseq"
-                ),
-
-                "scnsNo": row.get(
-                    "scnsNo"
-                ),
-
-                "start": (
-                    row.get("scnsrtTm")
-                    or row.get("scnStartTm")
-                    or row.get("startTime")
-                ),
-
-                "end": (
-                    row.get("scnendTm")
-                    or row.get("scnEndTm")
-                    or row.get("endTime")
-                ),
-
-                "screen": (
-                    row.get("expoScnsNm")
-                    or row.get("scnsNm")
-                    or row.get("scnsEnm")
-                    or row.get("screenNm")
-                    or "IMAX"
-                ),
-
-                "seats": seats,
-
-                "totalSeats": total_seat_count(
-                    row
-                ),
-            }
+            item
         )
 
     result.sort(
         key=lambda item: (
             str(
-                item.get("start")
+                item.get(
+                    "start"
+                )
                 or ""
             ),
             str(
-                item.get("scnSseq")
+                item.get(
+                    "scnSseq"
+                )
                 or ""
             ),
         )
@@ -1090,110 +1310,43 @@ def parse_sessions(
 
 
 # ============================================================
-# 날짜 하나 검사
+# 회차 고유키
 # ============================================================
 
-async def scan_date(
-    scn_ymd,
-    include_sold_out=False,
+def session_key(
+    item,
 ):
 
-    logger.info(
-        "🔎 날짜 검사: %s",
-        pretty_date(scn_ymd),
+    values = [
+        item.get("date"),
+        item.get("movNo"),
+        item.get("scnSseq"),
+        item.get("scnsNo"),
+        item.get("start"),
+    ]
+
+    return "|".join(
+        str(x)
+        for x in values
+        if x is not None
     )
-
-    payload = await call_cgv_api(
-        scn_ymd
-    )
-
-    if payload is None:
-
-        return []
-
-    sessions = parse_sessions(
-        payload,
-        scn_ymd,
-        include_sold_out=include_sold_out,
-    )
-
-    logger.info(
-        "%s → 대상 IMAX 회차 %d개",
-        pretty_date(scn_ymd),
-        len(sessions),
-    )
-
-    if not include_sold_out:
-
-        for session in sessions:
-
-            notify_session(
-                session
-            )
-
-    return sessions
-
-
-# ============================================================
-# 시간 표시
-# ============================================================
-
-def format_time(value):
-
-    if value is None:
-
-        return "??:??"
-
-    text = str(
-        value
-    )
-
-    if (
-        len(text) == 4
-        and text.isdigit()
-    ):
-
-        return (
-            text[:2]
-            + ":"
-            + text[2:]
-        )
-
-    if (
-        len(text) >= 12
-        and text.isdigit()
-    ):
-
-        # YYYYMMDDHHMM 형태 대응
-        return (
-            text[-4:-2]
-            + ":"
-            + text[-2:]
-        )
-
-    return text
 
 
 # ============================================================
 # Telegram 알림
 # ============================================================
 
-def notify_session(item):
+def notify_session(
+    item,
+):
 
-    key = "|".join(
-        str(value)
-        for value in [
-            item.get("date"),
-            item.get("movNo"),
-            item.get("scnSseq"),
-            item.get("scnsNo"),
-            item.get("start"),
-        ]
-        if value is not None
+    key = session_key(
+        item
     )
 
     now = time.time()
 
+    # 같은 회차는 6시간 동안 재알림 방지
     if key in seen_sessions:
 
         if (
@@ -1242,19 +1395,14 @@ def notify_session(item):
         f"🕐 {start} ~ {end}\n"
         f"💺 잔여 <b>{seats}석"
         f"{total_text}</b>\n\n"
-        "⚡ 지금 CGV에서 확인하세요!"
+        "⚡ CGV에서 지금 확인하세요!"
     )
 
     buttons = [
         [
             {
                 "text": f"🎟️ {start} 바로 예매",
-                "url": (
-                    "https://cgv.co.kr/"
-                    "cnm/movieBook/cinema"
-                    "?siteNm=CGV%EC%9A%A9%EC%82%B0"
-                    "&siteNo=0013"
-                ),
+                "url": CGV_WEB_URL,
             }
         ]
     ]
@@ -1273,12 +1421,90 @@ def notify_session(item):
 
 
 # ============================================================
-# 전체 감시
+# 날짜 하나 검사
+# ============================================================
+
+async def check_date(
+    scn_ymd,
+    include_sold_out=False,
+):
+
+    logger.info(
+        "=========================================="
+    )
+
+    logger.info(
+        "🔎 날짜 검사: %s",
+        pretty_date(scn_ymd),
+    )
+
+    payload = await asyncio.to_thread(
+        request_cgv_api,
+        scn_ymd,
+    )
+
+    if payload is None:
+
+        logger.warning(
+            "⚠️ %s API 응답 없음",
+            scn_ymd,
+        )
+
+        return []
+
+    status = payload.get(
+        "statusCode"
+    )
+
+    if str(status) not in (
+        "0",
+        "None",
+    ):
+
+        logger.warning(
+            "⚠️ CGV API statusCode=%s",
+            status,
+        )
+
+        logger.warning(
+            "statusMessage=%s",
+            payload.get(
+                "statusMessage"
+            ),
+        )
+
+    sessions = parse_sessions(
+        payload,
+        scn_ymd,
+        include_sold_out=include_sold_out,
+    )
+
+    logger.info(
+        "🎯 %s 대상 회차=%d",
+        pretty_date(scn_ymd),
+        len(sessions),
+    )
+
+    if not include_sold_out:
+
+        for item in sessions:
+
+            notify_session(
+                item
+            )
+
+    return sessions
+
+
+# ============================================================
+# 전체 검사
 # ============================================================
 
 async def perform_scan():
 
-    async with monitor_lock:
+    global last_successful_scan
+
+    async with scan_lock:
 
         dates = [
             make_ymd(i)
@@ -1288,41 +1514,53 @@ async def perform_scan():
         ]
 
         logger.info(
-            "=========================================="
-        )
-
-        logger.info(
-            "📡 API 감시 날짜: %s",
+            "📅 검사 날짜: %s",
             ", ".join(
-                dates
+                pretty_date(x)
+                for x in dates
             ),
         )
 
-        for index, date in enumerate(
+        for index, scn_ymd in enumerate(
             dates
         ):
 
-            try:
-
-                await scan_date(
-                    date,
-                    include_sold_out=False,
-                )
-
-            except Exception as exc:
-
-                logger.exception(
-                    "%s 검사 실패: %s",
-                    date,
-                    exc,
-                )
+            await check_date(
+                scn_ymd
+            )
 
             if (
                 index
                 < len(dates) - 1
             ):
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(
+                    0.5
+                )
+
+        last_successful_scan = (
+            time.time()
+        )
+
+
+# ============================================================
+# /test
+# ============================================================
+
+async def perform_test_scan():
+
+    async with scan_lock:
+
+        date = make_ymd(0)
+
+        logger.info(
+            "========== /test API 검사 =========="
+        )
+
+        return await check_date(
+            date,
+            include_sold_out=True,
+        )
 
 
 # ============================================================
@@ -1353,6 +1591,10 @@ async def health_server():
                 else ""
             )
 
+            # ------------------------------------------------
+            # STATUS
+            # ------------------------------------------------
+
             if first_line.startswith(
                 "GET /status"
             ):
@@ -1364,31 +1606,43 @@ async def health_server():
                 )
 
                 body = (
-                    "🟢 용아맥 API 감시 작동 중\n"
+                    "🟢 용아맥 API 감시 프로세스 작동 중\n"
                     f"monitor={status}\n"
-                    f"api_status={last_api_status}\n"
-                    f"last_response={last_api_response}\n"
+                    f"api={CGV_API_URL}\n"
+                    f"browser=NOT_USED\n"
+                    f"last_api_status={last_api_status}\n"
+                    f"last_api_response={last_api_response}"
                 )
+
+            # ------------------------------------------------
+            # TEST
+            # ------------------------------------------------
 
             elif first_line.startswith(
                 "GET /test"
             ):
 
+                logger.info(
+                    "========== HTTP /test =========="
+                )
+
                 try:
 
-                    sessions = await scan_date(
-                        make_ymd(0),
-                        include_sold_out=True,
+                    sessions = (
+                        await perform_test_scan()
                     )
 
                     body = (
                         "🟢 CGV API 테스트 완료\n"
-                        f"오늘 IMAX 회차: "
-                        f"{len(sessions)}개\n"
-                        f"HTTP: {last_api_status}"
+                        f"오늘 대상 IMAX 회차: "
+                        f"{len(sessions)}개"
                     )
 
                 except Exception as exc:
+
+                    logger.exception(
+                        "HTTP /test 실패"
+                    )
 
                     body = (
                         "🔴 테스트 실패: "
@@ -1433,11 +1687,8 @@ async def health_server():
             writer.close()
 
             try:
-
                 await writer.wait_closed()
-
             except Exception:
-
                 pass
 
     server = await asyncio.start_server(
@@ -1447,7 +1698,7 @@ async def health_server():
     )
 
     logger.info(
-        "Health server 시작: %d",
+        "🏥 Health server 시작: %d",
         PORT,
     )
 
@@ -1457,7 +1708,67 @@ async def health_server():
 
 
 # ============================================================
-# 메인 감시
+# API 준비
+# ============================================================
+
+async def prepare_api():
+
+    global http_session
+
+    logger.info(
+        "📡 CGV API 방식 준비"
+    )
+
+    http_session = create_http_session()
+
+    # CGV 웹을 한 번 방문해서
+    # Chrome 세션 / 쿠키 확보
+    await asyncio.to_thread(
+        warm_up_cgv
+    )
+
+    logger.info(
+        "📡 API URL: %s",
+        CGV_API_URL,
+    )
+
+    logger.info(
+        "coCd=%s",
+        CO_CD,
+    )
+
+    logger.info(
+        "siteNo=%s",
+        SITE_NO,
+    )
+
+    logger.info(
+        "rtctlScopCd=%s",
+        RTCTL_SCOP_CD,
+    )
+
+    logger.info(
+        "🏢 극장: %s",
+        THEATER_NAME,
+    )
+
+    logger.info(
+        "🎬 영화: %s",
+        ", ".join(
+            MOVIE_ALIASES
+        ),
+    )
+
+    logger.info(
+        "🎞️ 포맷: %s",
+        ", ".join(
+            FORMAT_KEYWORDS
+        ),
+    )
+
+
+# ============================================================
+# Monitor
 # ============================================================
 
 async def monitor():
@@ -1473,6 +1784,10 @@ async def monitor():
     )
 
     logger.info(
+        "방식: CGV API 직접 호출"
+    )
+
+    logger.info(
         "영화: %s",
         ", ".join(
             MOVIE_ALIASES
@@ -1485,21 +1800,6 @@ async def monitor():
     )
 
     logger.info(
-        "siteNo: %s",
-        SITE_NO,
-    )
-
-    logger.info(
-        "coCd: %s",
-        CO_CD,
-    )
-
-    logger.info(
-        "rtctlScopCd: %s",
-        RTCTL_SCOP_CD,
-    )
-
-    logger.info(
         "포맷: %s",
         ", ".join(
             FORMAT_KEYWORDS
@@ -1507,27 +1807,33 @@ async def monitor():
     )
 
     logger.info(
-        "간격: %d초",
+        "검사 간격: %d초",
         INTERVAL_SECONDS,
+    )
+
+    logger.info(
+        "검사 범위: 오늘 + %d일",
+        DAYS_AHEAD,
     )
 
     logger.info(
         "=========================================="
     )
 
-    create_http_session()
+    await prepare_api()
 
     send_telegram(
         "🟢 <b>용아맥 API 감시 프로그램 시작</b>\n\n"
         f"🎬 {', '.join(MOVIE_ALIASES)}\n"
         f"🏢 {THEATER_NAME}\n"
-        f"📍 siteNo={SITE_NO}\n"
         "🎞️ IMAX\n"
-        "📡 CGV 시간표 API 직접 조회\n\n"
-        "📱 Telegram 명령어\n"
+        f"📅 오늘 + {DAYS_AHEAD}일\n"
+        f"⏱️ {INTERVAL_SECONDS}초 간격\n\n"
+        "📡 CGV API 직접 조회 방식\n\n"
+        "📱 명령어\n"
         "/start  감시 시작\n"
         "/stop   감시 중지\n"
-        "/test   오늘 시간표 테스트\n"
+        "/test   현재 용아맥 현황\n"
         "/status 봇 상태"
     )
 
@@ -1535,7 +1841,9 @@ async def monitor():
 
         if not monitor_enabled:
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(
+                1
+            )
 
             continue
 
@@ -1546,15 +1854,39 @@ async def monitor():
         except Exception as exc:
 
             logger.exception(
-                "감시 사이클 오류: %s",
+                "🔴 감시 사이클 오류: %s",
                 exc,
             )
 
-            await asyncio.sleep(30)
+            await asyncio.sleep(
+                10
+            )
 
         await asyncio.sleep(
             INTERVAL_SECONDS
         )
+
+
+# ============================================================
+# 종료
+# ============================================================
+
+async def shutdown():
+
+    global http_session
+
+    logger.info(
+        "프로그램 종료"
+    )
+
+    try:
+
+        if http_session:
+
+            http_session.close()
+
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1589,6 +1921,8 @@ async def main():
         monitor_task.cancel()
         telegram_task.cancel()
 
+        await shutdown()
+
 
 # ============================================================
 # 실행
@@ -1612,4 +1946,4 @@ if __name__ == "__main__":
 
         logger.exception(
             "치명적 오류"
-)
+            )
