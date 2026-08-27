@@ -30,7 +30,7 @@ def check_cgv():
       movie_title = span.find_parent("div", class_="col-times").select_one(
           "a"
       ).text.strip()
-      if "산산조각" in movie_title:
+      if "오디세이" in movie_title:
         send_telegram(
             f"🚨 [용아맥] {movie_title} 예매 오픈!\n지금 바로 CGV 앱 접속하세요!"
         )
